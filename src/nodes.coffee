@@ -1139,8 +1139,9 @@ exports.Class = class Class extends Base
           if assign.variable.this
             func.static = yes
           else
-            acc = if base.isComplex() then new Index base else new Access base
-            assign.variable = new Value(new IdentifierLiteral(name), [(new Access new PropertyName 'prototype'), acc])
+            acc = if base.isComplex() then new Index base else base
+            assign.variable = new Value(acc)
+            assign.context = 'object'
             if func instanceof Code and func.bound
               @boundFuncs.push base
               func.bound = no
@@ -1161,6 +1162,7 @@ exports.Class = class Class extends Base
             cont = false
             exps[i] = @addProperties node, name, o
         child.expressions = exps = flatten exps
+        child.klass = this
       cont and child not instanceof Class
 
   # `use strict` (and other directives) must be the first expression statement(s)
@@ -1199,29 +1201,27 @@ exports.Class = class Class extends Base
 
     name  = @determineName()
     lname = new IdentifierLiteral name
-    func  = new Code [], Block.wrap [@body]
-    args  = []
-    o.classScope = func.makeScope o.scope
 
     @hoistDirectivePrologue()
     @setContext name
     @walkBody name, o
-    @ensureConstructor name
-    @addBoundFunctions o
+    # @ensureConstructor name
+    # @addBoundFunctions o
     @body.spaced = yes
-    @body.expressions.push lname
+    klass = Block.wrap [@body]
+
+    indent = o.indent + TAB
+    answer = klass.compileToFragments merge(o, {indent})
+    answer.unshift(@makeCode " {\n")
+    answer.push(@makeCode "\n#{@tab}}")
 
     if @parent
-      superClass = new IdentifierLiteral o.classScope.freeVariable 'superClass', reserve: no
-      @body.expressions.unshift new Extends lname, superClass
-      func.params.push new Param superClass
-      args.push @parent
+      answer.unshift(@makeCode " extends #{@parent.base.value}")
 
     @body.expressions.unshift @directives...
-
-    klass = new Parens new Call func, args
-    klass = new Assign @variable, klass if @variable
-    klass.compileToFragments o
+    answer.unshift(@makeCode " #{name}") if @variable
+    answer.unshift(@makeCode "class")
+    answer
 
 #### Assign
 
@@ -1247,17 +1247,19 @@ exports.Assign = class Assign extends Base
   # we've been assigned to, for correct internal references. If the variable
   # has not been seen yet within the current scope, declare it.
   compileNode: (o) ->
+    isClassMode = @context is 'object' or @value.static
+
     if isValue = @variable instanceof Value
+      if @value.static and @variable.properties.length is 1
+        @variable = new Value(@variable.properties[0].name)
       return @compilePatternMatch o if @variable.isArray() or @variable.isObject()
       return @compileSplice       o if @variable.isSplice()
       return @compileConditional  o if @context in ['||=', '&&=', '?=']
       return @compileSpecialMath  o if @context in ['**=', '//=', '%%=']
     if @value instanceof Code
-      if @value.static
+      if isClassMode
         @value.klass = @variable.base
-        @value.name  = @variable.properties[0]
-        @value.variable = @variable
-      else if @variable.properties?.length >= 2
+      if @variable.properties?.length >= 2
         [properties..., prototype, name] = @variable.properties
         if prototype.name?.value is 'prototype'
           @value.klass = new Value @variable.base, properties
@@ -1276,11 +1278,15 @@ exports.Assign = class Assign extends Base
     @variable.front = true if isValue and @variable.base instanceof Obj
     compiledName = @variable.compileToFragments o, LEVEL_LIST
 
-    if @context is 'object'
+    if isClassMode
       if fragmentsToText(compiledName) in JS_FORBIDDEN
         compiledName.unshift @makeCode '"'
         compiledName.push @makeCode '"'
-      return compiledName.concat @makeCode(": "), val
+      if @value.static
+        compiledName.unshift @makeCode "static "
+      if not (@value instanceof Code)
+        compiledName.push @makeCode ": "
+      return compiledName.concat val
 
     answer = compiledName.concat @makeCode(" #{ @context or '=' } "), val
     if o.level <= LEVEL_LIST then answer else @wrapInBraces answer
@@ -1516,7 +1522,7 @@ exports.Code = class Code extends Base
       node.error "multiple parameters named #{name}" if name in uniqs
       uniqs.push name
     @body.makeReturn() unless wasEmpty or @noReturn
-    code = 'function'
+    code = if @klass then "" else 'function'
     code += '*' if @isGenerator
     code += ' ' + @name if @ctor
     code += '('
